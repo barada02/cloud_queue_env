@@ -225,6 +225,22 @@ V2 reporting also includes:
 - [REPORT_SEED] task=<task_id> seed=<seed> score=<score> steps=<n> trace=<digest>
 - [REPORT] task=<task_id> seeds=<n> mean=<score> std=<score> ci95=<score>
 
+## Baseline Scores
+
+Current reproducible heuristic-only baseline (deployed runtime, single seed per task):
+
+| Task | Seed Count | Mean Score |
+|---|---:|---:|
+| easy | 1 | 0.000 |
+| medium | 1 | 0.000 |
+| hard | 1 | 0.000 |
+| final (mean of task means) | - | 0.000 |
+
+Notes:
+- These values are from heuristic fallback mode and are expected to be low.
+- Model-based scores depend on provider/model availability and should be recorded from a successful funded run.
+- Keep this table updated with your latest official benchmark run before final submission.
+
 ## Advanced Usage
 
 ### Connecting to an Existing Server
@@ -232,7 +248,7 @@ V2 reporting also includes:
 If you already have a Cloud Queue Env environment server running, you can connect directly:
 
 ```python
-from cloud_queue_env import CloudQueueEnv
+from cloud_queue_env import CloudQueueAction, CloudQueueEnv
 
 # Connect to existing server
 cloud_queue_envenv = CloudQueueEnv(base_url="<ENV_HTTP_URL_HERE>")
@@ -302,8 +318,6 @@ with ThreadPoolExecutor(max_workers=4) as executor:
 ## Development & Testing
 
 ### Direct Environment Testing
-
-Test the environment logic directly without starting the HTTP server:
 
 Core files:
 - models: typed action/observation schema
