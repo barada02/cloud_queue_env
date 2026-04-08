@@ -5,7 +5,7 @@ import json
 import os
 import textwrap
 from typing import List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -27,6 +27,7 @@ SEEDS = [11, 23, 37]
 TEMPERATURE = 0.2
 MAX_TOKENS = 180
 SUCCESS_SCORE_THRESHOLD = 0.60
+USE_HEURISTIC_ONLY = os.getenv("USE_HEURISTIC_ONLY", "false").lower() in {"1", "true", "yes"}
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
@@ -137,24 +138,40 @@ def normalize_base_url(base_url: Optional[str]) -> Optional[str]:
     parsed = urlparse(cleaned)
 
     # Handle Hugging Face repo page URL -> runtime URL used by API/WebSocket.
-    if parsed.netloc == "huggingface.co":
+    if parsed.netloc.lower() == "huggingface.co":
         parts = [p for p in parsed.path.strip("/").split("/") if p]
         if len(parts) >= 3 and parts[0] == "spaces":
             owner, space = parts[1], parts[2]
+            # HF runtime hostnames use lowercase and are TLS-safe.
+            owner = owner.lower().replace("_", "-")
+            space = space.lower().replace("_", "-")
             return f"https://{owner}-{space}.hf.space"
 
     # Avoid accidentally pointing at the web UI path.
     if cleaned.endswith("/web"):
-        return cleaned[:-4]
+        cleaned = cleaned[:-4]
+        parsed = urlparse(cleaned)
+
+    # HF runtime domains should be lowercase and avoid underscores for TLS host checks.
+    host = (parsed.hostname or "").lower()
+    if host.endswith(".hf.space"):
+        safe_host = host.replace("_", "-")
+        if safe_host != host or (parsed.netloc and parsed.netloc != parsed.netloc.lower()):
+            port_part = f":{parsed.port}" if parsed.port else ""
+            netloc = f"{safe_host}{port_part}"
+            parsed = parsed._replace(netloc=netloc)
+            cleaned = urlunparse(parsed)
 
     return cleaned
 
 
 async def main() -> None:
-    if not API_KEY:
+    if not API_KEY and not USE_HEURISTIC_ONLY:
         raise ValueError("HF_TOKEN is required for model inference.")
 
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    client = None
+    if not USE_HEURISTIC_ONLY:
+        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
     runtime_base_url = normalize_base_url(BASE_URL)
 
     if runtime_base_url:
@@ -197,14 +214,16 @@ async def main() -> None:
                     f"abandonment={obs.abandonment_rate:.3f}, cost={obs.energy_cost_rate:.3f}"
                 )
 
-                action = get_model_action(
-                    client=client,
-                    task_name=task_name,
-                    step=step,
-                    obs_summary=obs_summary,
-                    last_reward=last_reward,
-                    history=history,
-                )
+                action = None
+                if client is not None:
+                    action = get_model_action(
+                        client=client,
+                        task_name=task_name,
+                        step=step,
+                        obs_summary=obs_summary,
+                        last_reward=last_reward,
+                        history=history,
+                    )
                 if action is None:
                     action = choose_heuristic_action(
                         task_name=task_name,
