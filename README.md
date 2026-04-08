@@ -196,14 +196,22 @@ If invalid action rate exceeds threshold, score is capped.
 Run baseline inference across easy/medium/hard:
 
 ```bash
-HF_TOKEN=your_token_here python inference.py
+API_KEY=your_provider_key python inference.py
 ```
 
 Optional variables:
+- API_KEY (OpenAI-compatible provider key for model calls)
 - API_BASE_URL (default: https://router.huggingface.co/v1)
 - MODEL_NAME (default: Qwen/Qwen2.5-72B-Instruct)
 - BASE_URL (if using deployed space)
 - IMAGE_NAME (if launching local docker image)
+- USE_HEURISTIC_ONLY (true/false)
+- DISABLE_MODEL_ON_FIRST_ERROR (true/false)
+- MAX_STEPS_OVERRIDE (integer quick-test cap)
+- TASK_SEEDS_JSON (JSON map for multi-seed runs)
+- ACTION_TRACE_FILE (JSON replay file keyed by task:seed)
+- REPORT_JSON_PATH (write seed/task report JSON)
+- REPORT_CSV_PATH (write per-seed report CSV)
 
 Output includes required line types:
 - [START]
@@ -212,6 +220,10 @@ Output includes required line types:
 
 And final aggregate summary:
 - [SUMMARY] easy=<...> medium=<...> hard=<...> final=<...>
+
+V2 reporting also includes:
+- [REPORT_SEED] task=<task_id> seed=<seed> score=<score> steps=<n> trace=<digest>
+- [REPORT] task=<task_id> seeds=<n> mean=<score> std=<score> ci95=<score>
 
 ## Advanced Usage
 
