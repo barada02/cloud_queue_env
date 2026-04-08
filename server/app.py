@@ -38,7 +38,7 @@ except Exception as e:  # pragma: no cover
 try:
     from ..models import CloudQueueAction, CloudQueueObservation
     from .cloud_queue_env_environment import CloudQueueEnvironment
-except ModuleNotFoundError:
+except ImportError:
     from models import CloudQueueAction, CloudQueueObservation
     from server.cloud_queue_env_environment import CloudQueueEnvironment
 
