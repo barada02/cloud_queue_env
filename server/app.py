@@ -53,7 +53,7 @@ app = create_app(
 )
 
 
-def main(host: str = "0.0.0.0", port: int = 8000):
+def main(host: str = "0.0.0.0", port: int = 8000) -> None:
     """
     Entry point for direct execution via uv run or python -m.
 
@@ -75,10 +75,15 @@ def main(host: str = "0.0.0.0", port: int = 8000):
     uvicorn.run(app, host=host, port=port)
 
 
-if __name__ == "__main__":
+def _cli_main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--host", type=str, default="0.0.0.0")
     args = parser.parse_args()
-    main(port=args.port)
+    main(host=args.host, port=args.port)
+
+
+if __name__ == '__main__':
+    main()
