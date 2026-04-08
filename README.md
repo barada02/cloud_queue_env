@@ -196,14 +196,22 @@ If invalid action rate exceeds threshold, score is capped.
 Run baseline inference across easy/medium/hard:
 
 ```bash
-HF_TOKEN=your_token_here python inference.py
+API_KEY=your_provider_key python inference.py
 ```
 
 Optional variables:
+- API_KEY (OpenAI-compatible provider key for model calls)
 - API_BASE_URL (default: https://router.huggingface.co/v1)
 - MODEL_NAME (default: Qwen/Qwen2.5-72B-Instruct)
 - BASE_URL (if using deployed space)
 - IMAGE_NAME (if launching local docker image)
+- USE_HEURISTIC_ONLY (true/false)
+- DISABLE_MODEL_ON_FIRST_ERROR (true/false)
+- MAX_STEPS_OVERRIDE (integer quick-test cap)
+- TASK_SEEDS_JSON (JSON map for multi-seed runs)
+- ACTION_TRACE_FILE (JSON replay file keyed by task:seed)
+- REPORT_JSON_PATH (write seed/task report JSON)
+- REPORT_CSV_PATH (write per-seed report CSV)
 
 Output includes required line types:
 - [START]
@@ -213,6 +221,26 @@ Output includes required line types:
 And final aggregate summary:
 - [SUMMARY] easy=<...> medium=<...> hard=<...> final=<...>
 
+V2 reporting also includes:
+- [REPORT_SEED] task=<task_id> seed=<seed> score=<score> steps=<n> trace=<digest>
+- [REPORT] task=<task_id> seeds=<n> mean=<score> std=<score> ci95=<score>
+
+## Baseline Scores
+
+Current reproducible heuristic-only baseline (deployed runtime, single seed per task):
+
+| Task | Seed Count | Mean Score |
+|---|---:|---:|
+| easy | 1 | 0.000 |
+| medium | 1 | 0.000 |
+| hard | 1 | 0.000 |
+| final (mean of task means) | - | 0.000 |
+
+Notes:
+- These values are from heuristic fallback mode and are expected to be low.
+- Model-based scores depend on provider/model availability and should be recorded from a successful funded run.
+- Keep this table updated with your latest official benchmark run before final submission.
+
 ## Advanced Usage
 
 ### Connecting to an Existing Server
@@ -220,7 +248,7 @@ And final aggregate summary:
 If you already have a Cloud Queue Env environment server running, you can connect directly:
 
 ```python
-from cloud_queue_env import CloudQueueEnv
+from cloud_queue_env import CloudQueueAction, CloudQueueEnv
 
 # Connect to existing server
 cloud_queue_envenv = CloudQueueEnv(base_url="<ENV_HTTP_URL_HERE>")
@@ -290,8 +318,6 @@ with ThreadPoolExecutor(max_workers=4) as executor:
 ## Development & Testing
 
 ### Direct Environment Testing
-
-Test the environment logic directly without starting the HTTP server:
 
 Core files:
 - models: typed action/observation schema

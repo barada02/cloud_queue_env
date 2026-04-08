@@ -8,6 +8,7 @@
 
 import math
 import random
+import hashlib
 from collections import deque
 from dataclasses import dataclass
 from uuid import uuid4
@@ -52,7 +53,8 @@ class CloudQueueEnvironment(Environment):
         self._active_task_id = "easy"
         self._pending_task_id = "easy"
         self._pending_seed = 7
-        self._rng = random.Random(self._pending_seed)
+        self._rng_streams: dict[str, random.Random] = {}
+        self._rng_stream_seeds: dict[str, int] = {}
         self._state = State(episode_id=str(uuid4()), step_count=0)
         self._sim_time = 0
         self._queues: list[deque[dict]] = []
@@ -63,6 +65,7 @@ class CloudQueueEnvironment(Environment):
         self._utilization_ema: list[float] = []
         self._metrics: dict[str, float] = {}
         self._recent_rewards: deque[float] = deque(maxlen=8)
+        self._action_trace: list[str] = []
         self._reset_runtime_state()
 
     def _build_task_configs(self) -> dict[str, TaskConfig]:
@@ -138,6 +141,7 @@ class CloudQueueEnvironment(Environment):
         self._sim_time = 0
         self._done = False
         self._incoming_job = None
+        self._action_trace = []
         self._queues = [deque() for _ in range(cfg.queue_count)]
         self._servers = [
             {"remaining": 0.0, "job": None, "active": True}
@@ -163,6 +167,7 @@ class CloudQueueEnvironment(Environment):
             "sla_breaches_urgent": 0.0,
             "invalid_actions": 0.0,
             "noop_under_load": 0.0,
+            "harmful_scale_down": 0.0,
             "action_cost": 0.0,
             "infra_cost": 0.0,
             "fairness_gap_sum": 0.0,
@@ -173,9 +178,40 @@ class CloudQueueEnvironment(Environment):
         self._wait_samples_normal: list[float] = []
         self._e2e_wait_samples: list[float] = []
 
+    def _init_rng_streams(self, base_seed: int) -> None:
+        self._rng_stream_seeds = {
+            "arrivals": int(base_seed) + 101,
+            "service": int(base_seed) + 211,
+            "abandonment": int(base_seed) + 307,
+            "exogenous": int(base_seed) + 401,
+        }
+        self._rng_streams = {
+            key: random.Random(seed) for key, seed in self._rng_stream_seeds.items()
+        }
+
+    def _rng(self, stream: str) -> random.Random:
+        return self._rng_streams[stream]
+
+    def _sample_poisson(self, lam: float, rng: random.Random) -> int:
+        lam = max(0.0, lam)
+        if lam == 0.0:
+            return 0
+        # Knuth algorithm is sufficient for this environment's lambda scale.
+        l_term = math.exp(-lam)
+        k = 0
+        p = 1.0
+        while p > l_term:
+            k += 1
+            p *= rng.random()
+        return max(0, k - 1)
+
+    def _trace_digest(self) -> str:
+        raw = f"task={self._active_task_id}|seed={self._pending_seed}|" + "|".join(self._action_trace)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
     def reset(self) -> CloudQueueObservation:
         self._active_task_id = self._pending_task_id if self._pending_task_id in self._task_configs else "easy"
-        self._rng = random.Random(self._pending_seed)
+        self._init_rng_streams(self._pending_seed)
         self._state = State(episode_id=str(uuid4()), step_count=0)
         self._reset_runtime_state()
         return self._build_observation(reward=0.0, done=False, info={"event": "reset"})
@@ -184,30 +220,30 @@ class CloudQueueEnvironment(Environment):
         return max(lo, min(hi, value))
 
     def _sample_service_time(self, cfg: TaskConfig) -> float:
+        service_rng = self._rng("service")
         if cfg.task_id == "hard":
-            heavy = self._rng.random() < 0.22
+            heavy = service_rng.random() < 0.22
             if heavy:
-                return self._clamp(self._rng.lognormvariate(1.2, 0.7), 1.0, 12.0)
-        return self._clamp(self._rng.expovariate(1.0 / cfg.service_mean), 0.5, 10.0)
+                return self._clamp(service_rng.lognormvariate(1.2, 0.7), 1.0, 12.0)
+        return self._clamp(service_rng.expovariate(1.0 / cfg.service_mean), 0.5, 10.0)
 
     def _sample_arrivals(self, cfg: TaskConfig) -> int:
+        arrival_rng = self._rng("arrivals")
+        exogenous_rng = self._rng("exogenous")
         rate = cfg.arrival_rate
         if cfg.task_id == "hard":
             wave = 0.35 * math.sin((self._sim_time + 1) / 13.0)
-            rate += wave
-        base = int(rate)
-        frac = max(rate - base, 0.0)
-        count = base
-        if self._rng.random() < frac:
-            count += 1
-        return max(0, count)
+            jitter = exogenous_rng.uniform(-0.05, 0.05)
+            rate += wave + jitter
+        return self._sample_poisson(rate, arrival_rng)
 
     def _spawn_incoming_job(self, cfg: TaskConfig) -> None:
         arrivals = self._sample_arrivals(cfg)
         if arrivals <= 0:
             self._incoming_job = None
             return
-        priority = 2 if self._rng.random() < cfg.urgent_ratio else 1
+        arrival_rng = self._rng("arrivals")
+        priority = 2 if arrival_rng.random() < cfg.urgent_ratio else 1
         size = self._sample_service_time(cfg)
         self._incoming_job = {
             "priority": priority,
@@ -223,6 +259,7 @@ class CloudQueueEnvironment(Environment):
         self._metrics["arrivals"] += 1.0
 
     def _update_wait_and_abandonment(self, cfg: TaskConfig) -> float:
+        abandonment_rng = self._rng("abandonment")
         abandoned_this_step = 0.0
         for qi, q in enumerate(self._queues):
             kept: deque[dict] = deque()
@@ -230,7 +267,7 @@ class CloudQueueEnvironment(Environment):
                 job = q.popleft()
                 job["wait"] += 1.0
                 patience = cfg.deadline_base + (2 if job["priority"] == 2 else 4)
-                if cfg.task_id == "hard" and job["wait"] > patience and self._rng.random() < 0.35:
+                if cfg.task_id == "hard" and job["wait"] > patience and abandonment_rng.random() < 0.35:
                     abandoned_this_step += 1.0
                     continue
                 kept.append(job)
@@ -418,6 +455,7 @@ class CloudQueueEnvironment(Environment):
         cfg: TaskConfig,
         action_ok: bool,
         action_type: str,
+        action_scale_delta: int,
         completed_step: float,
     ) -> tuple[float, dict[str, float]]:
         avg_wait = self._safe_div(self._metrics["wait_sum"], self._metrics["wait_count"])
@@ -436,6 +474,16 @@ class CloudQueueEnvironment(Environment):
         if action_type == "noop" and self._incoming_job is not None and sum(len(q) for q in self._queues) > 0:
             r_safe -= 0.05
             self._metrics["noop_under_load"] += 1.0
+
+        arrivals = max(1.0, self._metrics["arrivals"])
+        rejection_rate = self._safe_div(self._metrics["rejected"], arrivals)
+        if arrivals > 10 and rejection_rate > 0.4:
+            r_safe -= self._clamp((rejection_rate - 0.4) * 0.4, 0.0, 0.2)
+
+        if action_type == "scale" and action_scale_delta < 0 and queue_pressure > 0.45:
+            overload_penalty = self._clamp((queue_pressure - 0.45) * 0.5, 0.0, 0.25)
+            r_safe -= overload_penalty
+            self._metrics["harmful_scale_down"] += 1.0
 
         reward = 0.35 * r_wait + 0.20 * r_throughput + 0.20 * r_sla + 0.15 * r_cost + 0.05 * r_fair + 0.05 * r_safe
         reward = self._clamp(reward, -1.0, 1.0)
@@ -553,6 +601,9 @@ class CloudQueueEnvironment(Environment):
             "info": info,
             "reward_components": info.get("reward_components", {}),
             "applied_action": info.get("applied_action", "noop"),
+            "seed": int(self._pending_seed),
+            "trace_digest": self._trace_digest(),
+            "rng_stream_seeds": self._rng_stream_seeds,
             "metrics": {
                 "arrivals": self._metrics["arrivals"],
                 "accepted": self._metrics["accepted"],
@@ -560,6 +611,7 @@ class CloudQueueEnvironment(Environment):
                 "completed": self._metrics["completed"],
                 "abandoned": self._metrics["abandoned"],
                 "invalid_actions": self._metrics["invalid_actions"],
+                "harmful_scale_down": self._metrics["harmful_scale_down"],
                 "infra_cost": round(self._metrics["infra_cost"], 4),
             },
             "episode_score": round(score, 4),
@@ -603,6 +655,7 @@ class CloudQueueEnvironment(Environment):
                 "valid_action": ok,
                 "note": note,
                 "completed_this_step": 0.0,
+                "debug_trace_id": self._trace_digest(),
             }
             return self._build_observation(reward=0.0, done=self._done, info=info)
 
@@ -614,6 +667,7 @@ class CloudQueueEnvironment(Environment):
                 "note": "call reset() to start a new episode",
                 "completed_this_step": 0.0,
                 "reward_components": {},
+                "debug_trace_id": self._trace_digest(),
             }
             return self._build_observation(reward=0.0, done=True, info=info)
 
@@ -625,11 +679,18 @@ class CloudQueueEnvironment(Environment):
         self._spawn_incoming_job(cfg)
 
         action_ok, action_note = self._apply_action(action, cfg)
+        action_key = (
+            f"{(action.action_type or 'noop').lower()}|"
+            f"q={action.target_queue}|s={action.target_server}|"
+            f"d={action.scale_delta}|p={action.new_priority}"
+        )
+        self._action_trace.append(action_key)
         self._autodispatch()
         reward, reward_components = self._compute_reward(
             cfg,
             action_ok=action_ok,
             action_type=(action.action_type or "noop").lower(),
+            action_scale_delta=int(action.scale_delta or 0),
             completed_step=completed_this_step,
         )
 
@@ -642,6 +703,7 @@ class CloudQueueEnvironment(Environment):
             "completed_this_step": completed_this_step,
             "abandoned_this_step": abandoned_this_step,
             "reward_components": reward_components,
+            "debug_trace_id": self._trace_digest(),
         }
         return self._build_observation(reward=reward, done=self._done, info=info)
 

@@ -1,8 +1,10 @@
 """Baseline inference runner for the queue operations benchmark tasks."""
 
 import asyncio
+import csv
 import json
 import os
+import statistics
 import textwrap
 from typing import List, Optional
 from urllib.parse import urlparse, urlunparse
@@ -22,15 +24,21 @@ BASE_URL = os.getenv("BASE_URL")
 API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
 MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
 
-API_KEY = os.getenv("API_KEY")
+API_KEY = os.getenv("API_KEY") or os.getenv("HF_TOKEN")
 
 BENCHMARK = os.getenv("BENCHMARK", "queueops-openenv")
 TASKS = ["easy", "medium", "hard"]
+TASK_SEEDS_JSON = os.getenv("TASK_SEEDS_JSON")
 SEEDS = [11, 23, 37]
 TEMPERATURE = 0.2
 MAX_TOKENS = 180
 SUCCESS_SCORE_THRESHOLD = 0.60
 USE_HEURISTIC_ONLY = os.getenv("USE_HEURISTIC_ONLY", "false").lower() in {"1", "true", "yes"}
+DISABLE_MODEL_ON_FIRST_ERROR = os.getenv("DISABLE_MODEL_ON_FIRST_ERROR", "true").lower() in {"1", "true", "yes"}
+MAX_STEPS_OVERRIDE = int(os.getenv("MAX_STEPS_OVERRIDE", "0") or "0")
+ACTION_TRACE_FILE = os.getenv("ACTION_TRACE_FILE")
+REPORT_JSON_PATH = os.getenv("REPORT_JSON_PATH")
+REPORT_CSV_PATH = os.getenv("REPORT_CSV_PATH")
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
@@ -60,6 +68,112 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
+
+
+def parse_task_seed_map() -> dict[str, list[int]]:
+    if TASK_SEEDS_JSON:
+        try:
+            data = json.loads(TASK_SEEDS_JSON)
+            task_map: dict[str, list[int]] = {}
+            for task_name, seeds in data.items():
+                parsed = [int(s) for s in seeds]
+                if parsed:
+                    task_map[str(task_name)] = parsed
+            if task_map:
+                return task_map
+        except Exception as exc:
+            print(f"[DEBUG] Invalid TASK_SEEDS_JSON, falling back to defaults: {exc}", flush=True)
+
+    return {
+        "easy": [SEEDS[0]],
+        "medium": [SEEDS[1]],
+        "hard": [SEEDS[2]],
+    }
+
+
+def _action_from_dict(data: dict) -> CloudQueueAction:
+    return CloudQueueAction(
+        action_type=str(data.get("action_type", "noop")),
+        target_queue=data.get("target_queue"),
+        target_server=data.get("target_server"),
+        scale_delta=data.get("scale_delta"),
+        new_priority=data.get("new_priority"),
+    )
+
+
+def load_replay_actions() -> dict[str, list[CloudQueueAction]]:
+    if not ACTION_TRACE_FILE:
+        return {}
+
+    try:
+        with open(ACTION_TRACE_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as exc:
+        print(f"[DEBUG] Failed to load ACTION_TRACE_FILE: {exc}", flush=True)
+        return {}
+
+    replay: dict[str, list[CloudQueueAction]] = {}
+    if isinstance(payload, dict):
+        for key, action_list in payload.items():
+            if not isinstance(action_list, list):
+                continue
+            parsed = []
+            for item in action_list:
+                if isinstance(item, dict):
+                    parsed.append(_action_from_dict(item))
+            if parsed:
+                replay[str(key)] = parsed
+    return replay
+
+
+def ci95(values: list[float]) -> float:
+    if len(values) <= 1:
+        return 0.0
+    std = statistics.pstdev(values)
+    return 1.96 * std / (len(values) ** 0.5)
+
+
+def write_reports(seed_rows: list[dict], task_score_table: dict[str, list[float]]) -> None:
+    if REPORT_JSON_PATH:
+        report_payload = {
+            "seed_rows": seed_rows,
+            "task_summary": {
+                task: {
+                    "mean": statistics.mean(scores) if scores else 0.0,
+                    "std": statistics.pstdev(scores) if len(scores) > 1 else 0.0,
+                    "ci95": ci95(scores),
+                    "count": len(scores),
+                }
+                for task, scores in task_score_table.items()
+            },
+        }
+        try:
+            with open(REPORT_JSON_PATH, "w", encoding="utf-8") as f:
+                json.dump(report_payload, f, indent=2)
+        except Exception as exc:
+            print(f"[DEBUG] Failed to write REPORT_JSON_PATH: {exc}", flush=True)
+
+    if REPORT_CSV_PATH:
+        try:
+            with open(REPORT_CSV_PATH, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "task",
+                        "seed",
+                        "score",
+                        "steps",
+                        "success",
+                        "trace_digest",
+                        "invalid_actions",
+                        "harmful_scale_down",
+                    ],
+                )
+                writer.writeheader()
+                for row in seed_rows:
+                    writer.writerow(row)
+        except Exception as exc:
+            print(f"[DEBUG] Failed to write REPORT_CSV_PATH: {exc}", flush=True)
 
 
 def build_user_prompt(step: int, obs_summary: str, last_reward: float, history: List[str], task_name: str) -> str:
@@ -108,7 +222,7 @@ def get_model_action(
     obs_summary: str,
     last_reward: float,
     history: List[str],
-) -> Optional[CloudQueueAction]:
+) -> tuple[Optional[CloudQueueAction], Optional[str]]:
     user_prompt = build_user_prompt(step, obs_summary, last_reward, history, task_name)
     try:
         completion = client.chat.completions.create(
@@ -122,10 +236,10 @@ def get_model_action(
             stream=False,
         )
         text = (completion.choices[0].message.content or "").strip()
-        return parse_model_action(text)
+        return parse_model_action(text), None
     except Exception as exc:
         print(f"[DEBUG] Model request failed: {exc}", flush=True)
-        return None
+        return None, str(exc)
 
 
 def normalize_base_url(base_url: Optional[str]) -> Optional[str]:
@@ -170,7 +284,7 @@ def normalize_base_url(base_url: Optional[str]) -> Optional[str]:
 
 async def main() -> None:
     if not API_KEY and not USE_HEURISTIC_ONLY:
-        raise ValueError("HF_TOKEN is required for model inference.")
+        raise ValueError("API_KEY is required for model inference.")
 
     client = None
     if not USE_HEURISTIC_ONLY:
@@ -187,90 +301,153 @@ async def main() -> None:
         env = await CloudQueueEnv.from_docker_image(IMAGE_NAME)
 
     try:
-        task_scores: List[float] = []
+        model_enabled = client is not None
+        task_seed_map = parse_task_seed_map()
+        replay_map = load_replay_actions()
+        task_score_table: dict[str, list[float]] = {}
+        seed_rows: list[dict] = []
 
-        for task_name, seed in zip(TASKS, SEEDS):
-            history: List[str] = []
-            rewards: List[float] = []
-            steps_taken = 0
-            score = 0.0
-            success = False
+        for task_name in TASKS:
+            seeds = task_seed_map.get(task_name, [])
+            if not seeds:
+                continue
 
-            log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
+            task_score_table[task_name] = []
 
-            await env.reset()
-            await env.step(
-                CloudQueueAction(action_type="configure_task", task_id=task_name, seed=seed)
-            )
-            result = await env.reset()
-            last_reward = 0.0
-            max_steps = max(1, int(result.observation.horizon))
+            for seed in seeds:
+                history: List[str] = []
+                rewards: List[float] = []
+                steps_taken = 0
+                score = 0.0
+                success = False
 
-            for step in range(1, max_steps + 1):
-                if result.done:
-                    break
+                log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
 
-                obs = result.observation
-                obs_summary = (
-                    f"queues={obs.queue_lengths}, incoming={obs.incoming_job_present}, "
-                    f"priority={obs.incoming_job_priority}, sla_rate={obs.sla_violation_rate:.3f}, "
-                    f"abandonment={obs.abandonment_rate:.3f}, cost={obs.energy_cost_rate:.3f}"
+                await env.reset()
+                await env.step(
+                    CloudQueueAction(action_type="configure_task", task_id=task_name, seed=seed)
                 )
+                result = await env.reset()
+                last_reward = 0.0
+                max_steps = max(1, int(result.observation.horizon))
+                if MAX_STEPS_OVERRIDE > 0:
+                    max_steps = min(max_steps, MAX_STEPS_OVERRIDE)
 
-                action = None
-                if client is not None:
-                    action = get_model_action(
-                        client=client,
-                        task_name=task_name,
-                        step=step,
-                        obs_summary=obs_summary,
-                        last_reward=last_reward,
-                        history=history,
-                    )
-                if action is None:
-                    action = choose_heuristic_action(
-                        task_name=task_name,
-                        queue_lengths=obs.queue_lengths,
-                        incoming_present=obs.incoming_job_present,
+                for step in range(1, max_steps + 1):
+                    if result.done:
+                        break
+
+                    obs = result.observation
+                    obs_summary = (
+                        f"queues={obs.queue_lengths}, incoming={obs.incoming_job_present}, "
+                        f"priority={obs.incoming_job_priority}, sla_rate={obs.sla_violation_rate:.3f}, "
+                        f"abandonment={obs.abandonment_rate:.3f}, cost={obs.energy_cost_rate:.3f}"
                     )
 
-                result = await env.step(action)
-                reward = float(result.reward or 0.0)
-                done = bool(result.done)
-                error = None
+                    action = None
+                    model_error = None
+                    replay_key = f"{task_name}:{seed}"
+                    replay_actions = replay_map.get(replay_key, [])
+                    if step - 1 < len(replay_actions):
+                        action = replay_actions[step - 1]
+
+                    if action is None and model_enabled and client is not None:
+                        action, model_error = get_model_action(
+                            client=client,
+                            task_name=task_name,
+                            step=step,
+                            obs_summary=obs_summary,
+                            last_reward=last_reward,
+                            history=history,
+                        )
+                        if model_error and DISABLE_MODEL_ON_FIRST_ERROR:
+                            model_enabled = False
+                            print("[DEBUG] Disabling model calls and switching to heuristic fallback.", flush=True)
+
+                    if action is None:
+                        action = choose_heuristic_action(
+                            task_name=task_name,
+                            queue_lengths=obs.queue_lengths,
+                            incoming_present=obs.incoming_job_present,
+                        )
+
+                    result = await env.step(action)
+                    reward = float(result.reward or 0.0)
+                    done = bool(result.done)
+                    error = None
+                    meta = result.observation.metadata or {}
+                    info = meta.get("info", {}) if isinstance(meta, dict) else {}
+                    if isinstance(info, dict) and info.get("valid_action") is False:
+                        error = str(info.get("note", "invalid_action"))
+
+                    rewards.append(reward)
+                    steps_taken = step
+                    last_reward = reward
+
+                    action_str = (
+                        f"{action.action_type}(q={action.target_queue},s={action.target_server},"
+                        f"d={action.scale_delta},p={action.new_priority})"
+                    )
+                    log_step(step=step, action=action_str, reward=reward, done=done, error=error)
+
+                    history.append(f"step={step} action={action_str} reward={reward:.2f}")
+
+                    if done:
+                        break
+
+                if isinstance(result.observation.metadata, dict):
+                    score = float(result.observation.metadata.get("episode_score", 0.0) or 0.0)
+                score = max(0.0, min(1.0, score))
+                task_score_table[task_name].append(score)
+                success = score >= SUCCESS_SCORE_THRESHOLD
+                log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+
                 meta = result.observation.metadata or {}
-                info = meta.get("info", {}) if isinstance(meta, dict) else {}
-                if isinstance(info, dict) and info.get("valid_action") is False:
-                    error = str(info.get("note", "invalid_action"))
-
-                rewards.append(reward)
-                steps_taken = step
-                last_reward = reward
-
-                action_str = (
-                    f"{action.action_type}(q={action.target_queue},s={action.target_server},"
-                    f"d={action.scale_delta},p={action.new_priority})"
+                metrics = meta.get("metrics", {}) if isinstance(meta, dict) else {}
+                seed_row = {
+                    "task": task_name,
+                    "seed": int(seed),
+                    "score": round(score, 6),
+                    "steps": int(steps_taken),
+                    "success": bool(success),
+                    "trace_digest": str(meta.get("trace_digest", "")),
+                    "invalid_actions": float(metrics.get("invalid_actions", 0.0)),
+                    "harmful_scale_down": float(metrics.get("harmful_scale_down", 0.0)),
+                }
+                seed_rows.append(seed_row)
+                print(
+                    "[REPORT_SEED] "
+                    f"task={seed_row['task']} seed={seed_row['seed']} score={seed_row['score']:.3f} "
+                    f"steps={seed_row['steps']} trace={seed_row['trace_digest']}",
+                    flush=True,
                 )
-                log_step(step=step, action=action_str, reward=reward, done=done, error=error)
 
-                history.append(f"step={step} action={action_str} reward={reward:.2f}")
-
-                if done:
-                    break
-
-            if isinstance(result.observation.metadata, dict):
-                score = float(result.observation.metadata.get("episode_score", 0.0) or 0.0)
-            score = max(0.0, min(1.0, score))
-            task_scores.append(score)
-            success = score >= SUCCESS_SCORE_THRESHOLD
-            log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
-
-        if task_scores:
-            final_score = sum(task_scores) / len(task_scores)
+            task_scores = task_score_table[task_name]
+            task_mean = statistics.mean(task_scores) if task_scores else 0.0
+            task_std = statistics.pstdev(task_scores) if len(task_scores) > 1 else 0.0
+            task_ci = ci95(task_scores)
             print(
-                f"[SUMMARY] easy={task_scores[0]:.3f} medium={task_scores[1]:.3f} hard={task_scores[2]:.3f} final={final_score:.3f}",
+                f"[REPORT] task={task_name} seeds={len(task_scores)} mean={task_mean:.3f} std={task_std:.3f} ci95={task_ci:.3f}",
                 flush=True,
             )
+
+        all_task_means = []
+        for task_name in TASKS:
+            scores = task_score_table.get(task_name, [])
+            if scores:
+                all_task_means.append(statistics.mean(scores))
+
+        if all_task_means:
+            final_score = sum(all_task_means) / len(all_task_means)
+            easy_mean = statistics.mean(task_score_table.get("easy", [0.0]))
+            medium_mean = statistics.mean(task_score_table.get("medium", [0.0]))
+            hard_mean = statistics.mean(task_score_table.get("hard", [0.0]))
+            print(
+                f"[SUMMARY] easy={easy_mean:.3f} medium={medium_mean:.3f} hard={hard_mean:.3f} final={final_score:.3f}",
+                flush=True,
+            )
+
+            write_reports(seed_rows=seed_rows, task_score_table=task_score_table)
 
     finally:
         try:
