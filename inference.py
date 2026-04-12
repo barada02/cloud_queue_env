@@ -40,6 +40,9 @@ ACTION_TRACE_FILE = os.getenv("ACTION_TRACE_FILE")
 REPORT_JSON_PATH = os.getenv("REPORT_JSON_PATH")
 REPORT_CSV_PATH = os.getenv("REPORT_CSV_PATH")
 
+OPEN_SCORE_MIN = 0.001
+OPEN_SCORE_MAX = 0.999
+
 SYSTEM_PROMPT = textwrap.dedent(
     """
     You are an agent controlling a cloud queue scheduling environment.
@@ -111,6 +114,12 @@ MODEL_ACTION_RESPONSE_FORMAT = {
 }
 
 _SCHEMA_RESPONSE_FORMAT_FAILED = False
+
+
+def clamp_open_score(value: float) -> float:
+    if not isinstance(value, (int, float)) or not (value == value):
+        return OPEN_SCORE_MIN
+    return max(OPEN_SCORE_MIN, min(OPEN_SCORE_MAX, float(value)))
 
 
 def log_start(task: str, env: str, model: str) -> None:
@@ -599,7 +608,7 @@ async def main() -> None:
                 history: List[str] = []
                 rewards: List[float] = []
                 steps_taken = 0
-                score = 0.0
+                score = OPEN_SCORE_MIN
                 success = False
 
                 log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
@@ -673,7 +682,7 @@ async def main() -> None:
                         break
 
                 if isinstance(result.observation.metadata, dict):
-                    score = float(result.observation.metadata.get("episode_score", 0.0) or 0.0)
+                    score = float(result.observation.metadata.get("episode_score", OPEN_SCORE_MIN) or OPEN_SCORE_MIN)
                     # Debug: print raw server metadata so we can verify grader output
                     _m = result.observation.metadata
                     print(
@@ -684,7 +693,7 @@ async def main() -> None:
                         f"metrics_arrivals={_m.get('metrics', {}).get('arrivals')}",
                         flush=True,
                     )
-                score = max(0.0, min(1.0, score))
+                score = clamp_open_score(score)
                 task_score_table[task_name].append(score)
                 success = score >= SUCCESS_SCORE_THRESHOLD
                 log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
@@ -710,7 +719,7 @@ async def main() -> None:
                 )
 
             task_scores = task_score_table[task_name]
-            task_mean = statistics.mean(task_scores) if task_scores else 0.0
+            task_mean = statistics.mean(task_scores) if task_scores else OPEN_SCORE_MIN
             task_std = statistics.pstdev(task_scores) if len(task_scores) > 1 else 0.0
             task_ci = ci95(task_scores)
             print(
@@ -725,10 +734,10 @@ async def main() -> None:
                 all_task_means.append(statistics.mean(scores))
 
         if all_task_means:
-            final_score = sum(all_task_means) / len(all_task_means)
-            easy_mean = statistics.mean(task_score_table.get("easy", [0.0]))
-            medium_mean = statistics.mean(task_score_table.get("medium", [0.0]))
-            hard_mean = statistics.mean(task_score_table.get("hard", [0.0]))
+            final_score = clamp_open_score(sum(all_task_means) / len(all_task_means))
+            easy_mean = clamp_open_score(statistics.mean(task_score_table.get("easy", [OPEN_SCORE_MIN])))
+            medium_mean = clamp_open_score(statistics.mean(task_score_table.get("medium", [OPEN_SCORE_MIN])))
+            hard_mean = clamp_open_score(statistics.mean(task_score_table.get("hard", [OPEN_SCORE_MIN])))
             print(
                 f"[SUMMARY] easy={easy_mean:.3f} medium={medium_mean:.3f} hard={hard_mean:.3f} final={final_score:.3f}",
                 flush=True,
