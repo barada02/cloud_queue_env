@@ -504,10 +504,21 @@ class CloudQueueEnvironment(Environment):
         return reward, components
 
     def _score_task(self, cfg: TaskConfig) -> tuple[float, dict[str, float]]:
+        # c01: clamp individual sub-score components to [0, 1] inclusive.
         def c01(value: float) -> float:
             if not math.isfinite(value):
                 return 0.0
             return self._clamp(value, 0.0, 1.0)
+
+        # _strict01: final clamp applied only to the episode score.
+        # Validator requires score strictly in (0, 1) — never 0.0 or 1.0.
+        _SCORE_MIN = 0.001
+        _SCORE_MAX = 0.999
+
+        def strict01(value: float) -> float:
+            if not math.isfinite(value):
+                return _SCORE_MIN
+            return self._clamp(value, _SCORE_MIN, _SCORE_MAX)
 
         completed = self._metrics["completed"]
         arrivals = self._metrics["arrivals"]
@@ -568,7 +579,8 @@ class CloudQueueEnvironment(Environment):
 
         if self._metrics["invalid_actions"] > max(3.0, 0.04 * cfg.horizon):
             score = min(score, 0.4)
-        return c01(score), details
+        # Apply strict open-interval clamp: validator rejects 0.0 and 1.0.
+        return strict01(score), details
 
     def _build_observation(self, reward: float, done: bool, info: dict) -> CloudQueueObservation:
         cfg = self._task_configs[self._active_task_id]
