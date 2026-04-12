@@ -6,7 +6,7 @@ import json
 import os
 import statistics
 import textwrap
-from typing import List, Optional
+from typing import Any, List, Optional
 from urllib.parse import urlparse, urlunparse
 
 from dotenv import load_dotenv
@@ -14,7 +14,7 @@ from openai import OpenAI
 
 load_dotenv()  # Load environment variables from .env file
 
-from cloud_queue_env import CloudQueueAction, CloudQueueEnv
+from cloud_queue_env import CloudQueueAction, CloudQueueEnv, CloudQueueObservation
 
 
 IMAGE_NAME = os.getenv("IMAGE_NAME")
@@ -65,6 +65,52 @@ SYSTEM_PROMPT = textwrap.dedent(
     Return ONLY valid JSON. No explanation.
     """
 ).strip()
+
+
+ACTION_TYPES = (
+    "configure_task",
+    "admit",
+    "reject",
+    "route",
+    "dispatch",
+    "scale",
+    "reprioritize",
+    "noop",
+)
+
+TASK_ALLOWED_ACTIONS = {
+    "easy": {"admit", "reject", "dispatch", "noop"},
+    "medium": {"admit", "reject", "route", "dispatch", "reprioritize", "noop"},
+    "hard": {"admit", "reject", "route", "dispatch", "reprioritize", "scale", "noop"},
+}
+
+MODEL_ACTION_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "cloud_queue_action",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "action_type",
+                "target_queue",
+                "target_server",
+                "scale_delta",
+                "new_priority",
+            ],
+            "properties": {
+                "action_type": {"type": "string", "enum": list(ACTION_TYPES)},
+                "target_queue": {"type": ["integer", "null"], "minimum": 0},
+                "target_server": {"type": ["integer", "null"], "minimum": 0},
+                "scale_delta": {"type": ["integer", "null"], "minimum": -2, "maximum": 2},
+                "new_priority": {"type": ["integer", "null"], "minimum": 0, "maximum": 3},
+            },
+        },
+    },
+}
+
+_SCHEMA_RESPONSE_FORMAT_FAILED = False
 
 
 def log_start(task: str, env: str, model: str) -> None:
@@ -191,7 +237,7 @@ def write_reports(seed_rows: list[dict], task_score_table: dict[str, list[float]
             print(f"[DEBUG] Failed to write REPORT_CSV_PATH: {exc}", flush=True)
 
 
-def build_obs_summary(obs: "CloudQueueObservation", task_name: str) -> str:
+def build_obs_summary(obs: CloudQueueObservation, task_name: str) -> str:
     """Build a rich, structured text summary of the observation for the LLM prompt."""
     # Queue fill percentages — helps model know when to reject
     max_sizes = {"easy": 28, "medium": 42, "hard": 64}
@@ -244,16 +290,135 @@ def choose_heuristic_action(task_name: str, queue_lengths: List[int], incoming_p
     return CloudQueueAction(action_type="dispatch", target_queue=0)
 
 
-def parse_model_action(text: str) -> Optional[CloudQueueAction]:
+def _coerce_optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        txt = value.strip().lower()
+        if txt in {"", "null", "none"}:
+            return None
+        try:
+            return int(txt)
+        except ValueError:
+            try:
+                return int(float(txt))
+            except ValueError:
+                return None
+    return None
+
+
+def _extract_json_object(text: str) -> Optional[dict[str, Any]]:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return None
+
+    # Handle common fenced responses first.
+    if cleaned.startswith("```"):
+        chunks = [chunk.strip() for chunk in cleaned.split("```") if chunk.strip()]
+        for chunk in chunks:
+            candidate = chunk
+            if candidate.lower().startswith("json"):
+                candidate = candidate[4:].strip()
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+                if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                    return parsed[0]
+            except Exception:
+                continue
+
     try:
-        data = json.loads(text)
-        return CloudQueueAction(
-            action_type=str(data.get("action_type", "noop")),
-            target_queue=data.get("target_queue"),
-            target_server=data.get("target_server"),
-            scale_delta=data.get("scale_delta"),
-            new_priority=data.get("new_priority"),
-        )
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+            return parsed[0]
+    except Exception:
+        pass
+
+    # Fallback: extract the first balanced JSON object from noisy text.
+    start = 0
+    while True:
+        open_idx = cleaned.find("{", start)
+        if open_idx < 0:
+            return None
+        depth = 0
+        for i in range(open_idx, len(cleaned)):
+            ch = cleaned[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = cleaned[open_idx : i + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                        if isinstance(parsed, dict):
+                            return parsed
+                    except Exception:
+                        break
+        start = open_idx + 1
+
+
+def _normalize_action_payload(data: dict[str, Any], task_name: str) -> Optional[dict[str, Any]]:
+    action_type = str(data.get("action_type", "noop")).strip().lower()
+    if action_type not in ACTION_TYPES:
+        return None
+
+    if action_type not in TASK_ALLOWED_ACTIONS.get(task_name, set(ACTION_TYPES)):
+        return None
+
+    target_queue = _coerce_optional_int(data.get("target_queue"))
+    target_server = _coerce_optional_int(data.get("target_server"))
+    scale_delta = _coerce_optional_int(data.get("scale_delta"))
+    new_priority = _coerce_optional_int(data.get("new_priority"))
+
+    if action_type in {"admit", "route", "dispatch"} and target_queue is None:
+        target_queue = 0
+    if action_type in {"reject", "noop"}:
+        target_queue = None
+        target_server = None
+
+    if action_type == "scale":
+        if scale_delta is None:
+            return None
+        scale_delta = max(-2, min(2, scale_delta))
+    else:
+        scale_delta = None
+
+    if action_type == "reprioritize":
+        if new_priority is None:
+            new_priority = 2
+    else:
+        new_priority = None
+
+    return {
+        "action_type": action_type,
+        "target_queue": target_queue,
+        "target_server": target_server,
+        "scale_delta": scale_delta,
+        "new_priority": new_priority,
+    }
+
+
+def parse_model_action(text: str, task_name: str) -> Optional[CloudQueueAction]:
+    data = _extract_json_object(text)
+    if data is None:
+        return None
+
+    payload = _normalize_action_payload(data, task_name)
+    if payload is None:
+        return None
+
+    try:
+        return CloudQueueAction(**payload)
     except Exception:
         return None
 
@@ -266,20 +431,53 @@ def get_model_action(
     last_reward: float,
     history: List[str],
 ) -> tuple[Optional[CloudQueueAction], Optional[str]]:
+    global _SCHEMA_RESPONSE_FORMAT_FAILED
+
     user_prompt = build_user_prompt(step, obs_summary, last_reward, history, task_name)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
     try:
-        completion = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
-            stream=False,
-        )
+        if not _SCHEMA_RESPONSE_FORMAT_FAILED:
+            try:
+                completion = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    temperature=TEMPERATURE,
+                    max_tokens=MAX_TOKENS,
+                    stream=False,
+                    response_format=MODEL_ACTION_RESPONSE_FORMAT,
+                )
+            except Exception as schema_exc:
+                _SCHEMA_RESPONSE_FORMAT_FAILED = True
+                print(
+                    f"[DEBUG] response_format unavailable, retrying without schema: {schema_exc}",
+                    flush=True,
+                )
+                completion = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    temperature=TEMPERATURE,
+                    max_tokens=MAX_TOKENS,
+                    stream=False,
+                )
+        else:
+            completion = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                temperature=TEMPERATURE,
+                max_tokens=MAX_TOKENS,
+                stream=False,
+            )
+
         text = (completion.choices[0].message.content or "").strip()
-        return parse_model_action(text), None
+        action = parse_model_action(text, task_name)
+        if action is None:
+            preview = " ".join(text.split())[:180]
+            return None, f"invalid_model_action_payload: {preview}"
+        return action, None
     except Exception as exc:
         print(f"[DEBUG] Model request failed: {exc}", flush=True)
         return None, str(exc)
