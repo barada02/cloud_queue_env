@@ -5,3 +5,26 @@ runtime: fastapi
 app: server.app:app
 port: 8000
 
+metadata:
+  description: >
+    A real-world queueing control environment where an agent manages
+    cloud request scheduling decisions — admission control, routing,
+    dispatching, and dynamic server scaling — under stochastic arrivals
+    and service times. Optimizes latency, throughput, SLA compliance,
+    fairness, and infrastructure cost across three benchmark tasks
+    (Easy / Medium / Hard) with deterministic graders scored in (0, 1).
+  tags:
+    - openenv
+    - reinforcement-learning
+    - queueing
+    - scheduling
+    - cloud-operations
+    - multi-objective
+    - llm-agent
+  difficulty: easy-to-hard
+  tasks:
+    - easy
+    - medium
+    - hard
+  author: Mrkumar007
+
