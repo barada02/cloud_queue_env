@@ -95,8 +95,8 @@ class CloudQueueEnvironment(Environment):
                 level=2.3,
                 queue_count=2,
                 initial_servers=3,
-                min_servers=2,
-                max_servers=4,
+                min_servers=3,   # scaling disabled on medium — lock to initial_servers
+                max_servers=3,   # scaling disabled on medium — lock to initial_servers
                 arrival_rate=1.15,
                 urgent_ratio=0.28,
                 service_mean=1.8,
@@ -582,6 +582,44 @@ class CloudQueueEnvironment(Environment):
         # Apply strict open-interval clamp: validator rejects 0.0 and 1.0.
         return strict01(score), details
 
+    def _compute_action_mask(self, cfg: TaskConfig) -> list[int]:
+        """Compute which of the 8 actions are valid right now.
+
+        Slot order (matches CloudQueueAction.action_type):
+          0: configure_task  — always valid (meta, sets next task/seed)
+          1: admit           — only if an incoming job is waiting
+          2: reject          — only if an incoming job is waiting
+          3: route           — only if an incoming job is waiting
+          4: dispatch        — only if an idle+active server AND a non-empty queue exist
+          5: scale           — only if cfg.allow_scaling is True
+          6: reprioritize    — only if cfg.allow_priority AND a normal-priority job is queued
+          7: noop            — always valid
+        """
+        has_incoming = self._incoming_job is not None
+
+        has_idle_server = any(
+            s["active"] and s["job"] is None for s in self._servers
+        )
+        has_queued_job = any(len(q) > 0 for q in self._queues)
+        can_dispatch = 1 if (has_idle_server and has_queued_job) else 0
+
+        can_reprioritize = 0
+        if cfg.allow_priority:
+            can_reprioritize = 1 if any(
+                job["priority"] == 1 for q in self._queues for job in q
+            ) else 0
+
+        return [
+            1,                              # 0: configure_task
+            1 if has_incoming else 0,       # 1: admit
+            1 if has_incoming else 0,       # 2: reject
+            1 if has_incoming else 0,       # 3: route
+            can_dispatch,                   # 4: dispatch
+            1 if cfg.allow_scaling else 0,  # 5: scale
+            can_reprioritize,               # 6: reprioritize
+            1,                              # 7: noop
+        ]
+
     def _build_observation(self, reward: float, done: bool, info: dict) -> CloudQueueObservation:
         cfg = self._task_configs[self._active_task_id]
         queue_lengths = [len(q) for q in self._queues]
@@ -650,7 +688,7 @@ class CloudQueueEnvironment(Environment):
             energy_cost_rate=round(energy_cost_rate, 4),
             level=cfg.level,
             optional_history=[round(v, 4) for v in list(self._recent_rewards)],
-            action_mask=[1 for _ in range(8)],
+            action_mask=self._compute_action_mask(cfg),
             done=done,
             reward=round(reward, 6),
             metadata=metadata,
