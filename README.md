@@ -351,3 +351,19 @@ cloud_queue_env/
     ├── app.py
     └── Dockerfile
 ```
+
+TASK A — Easy (150 steps)
+  Scenario:  1 queue, 1 server (M/M/1), only admit/reject/dispatch
+  Objective: Keep wait low while processing throughput
+  Grader:    score = 0.40×(1-avg_wait/6) + 0.30×(throughput/70)
+                   + 0.15×(1-rejection_rate/0.3) + 0.15×(1-sla_breaches/0.3)
+TASK B — Medium (200 steps)
+  Scenario:  2 queues, 3 servers, 28% urgent jobs → route + reprioritize
+  Objective: Protect urgent SLA while not starving normal jobs
+  Grader:    score = 0.35×urgent_wait_score + 0.25×urgent_sla_score
+                   + 0.15×normal_wait_score + 0.15×throughput + 0.10×cost
+TASK C — Hard (250 steps)
+  Scenario:  2-stage pipeline, 1–6 servers, heavy-tail service, abandonments
+  Objective: Maximize quality under budget with fairness
+  Grader:    score = 0.25×e2e_latency + 0.20×abandonment + 0.20×sla
+                   + 0.15×throughput + 0.10×cost + 0.10×fairness

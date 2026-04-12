@@ -47,6 +47,8 @@ class CloudQueueEnvironment(Environment):
     """Deterministic queueing environment with easy/medium/hard benchmark tasks."""
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
+    # Benchmark-safe default: dispatch decisions should come from the agent.
+    ASSISTED_AUTODISPATCH: bool = False
 
     def __init__(self):
         self._task_configs = self._build_task_configs()
@@ -59,6 +61,7 @@ class CloudQueueEnvironment(Environment):
         self._sim_time = 0
         self._queues: list[deque[dict]] = []
         self._servers: list[dict] = []
+        self._incoming_buffer: deque[dict] = deque()
         self._incoming_job: dict | None = None
         self._done = False
         self._wait_ema: list[float] = []
@@ -95,8 +98,8 @@ class CloudQueueEnvironment(Environment):
                 level=2.3,
                 queue_count=2,
                 initial_servers=3,
-                min_servers=2,
-                max_servers=4,
+                min_servers=3,   # scaling disabled on medium — lock to initial_servers
+                max_servers=3,   # scaling disabled on medium — lock to initial_servers
                 arrival_rate=1.15,
                 urgent_ratio=0.28,
                 service_mean=1.8,
@@ -140,6 +143,7 @@ class CloudQueueEnvironment(Environment):
         cfg = self._task_configs[self._active_task_id]
         self._sim_time = 0
         self._done = False
+        self._incoming_buffer = deque()
         self._incoming_job = None
         self._action_trace = []
         self._queues = [deque() for _ in range(cfg.queue_count)]
@@ -237,15 +241,10 @@ class CloudQueueEnvironment(Environment):
             rate += wave + jitter
         return self._sample_poisson(rate, arrival_rng)
 
-    def _spawn_incoming_job(self, cfg: TaskConfig) -> None:
-        arrivals = self._sample_arrivals(cfg)
-        if arrivals <= 0:
-            self._incoming_job = None
-            return
-        arrival_rng = self._rng("arrivals")
+    def _build_arrival_job(self, cfg: TaskConfig, arrival_rng: random.Random) -> dict:
         priority = 2 if arrival_rng.random() < cfg.urgent_ratio else 1
         size = self._sample_service_time(cfg)
-        self._incoming_job = {
+        return {
             "priority": priority,
             "queue": 0,
             "created_step": self._state.step_count,
@@ -256,7 +255,19 @@ class CloudQueueEnvironment(Environment):
             "type": 1 if priority == 2 else 0,
             "stage": 0,
         }
-        self._metrics["arrivals"] += 1.0
+
+    def _promote_next_incoming_job(self) -> None:
+        if self._incoming_job is None and self._incoming_buffer:
+            self._incoming_job = self._incoming_buffer.popleft()
+
+    def _spawn_incoming_job(self, cfg: TaskConfig) -> None:
+        arrivals = self._sample_arrivals(cfg)
+        arrival_rng = self._rng("arrivals")
+        if arrivals > 0:
+            for _ in range(arrivals):
+                self._incoming_buffer.append(self._build_arrival_job(cfg, arrival_rng))
+            self._metrics["arrivals"] += float(arrivals)
+        self._promote_next_incoming_job()
 
     def _update_wait_and_abandonment(self, cfg: TaskConfig) -> float:
         abandonment_rng = self._rng("abandonment")
@@ -329,12 +340,14 @@ class CloudQueueEnvironment(Environment):
         if len(self._queues[queue_idx]) >= cfg.max_queue_size:
             self._metrics["rejected"] += 1.0
             self._incoming_job = None
+            self._promote_next_incoming_job()
             return True, "queue_full_rejected"
         job = dict(self._incoming_job)
         job["queue"] = queue_idx
         self._queues[queue_idx].append(job)
         self._incoming_job = None
         self._metrics["accepted"] += 1.0
+        self._promote_next_incoming_job()
         return True, "admitted"
 
     def _dispatch(self, queue_idx: int | None) -> tuple[bool, str]:
@@ -382,6 +395,7 @@ class CloudQueueEnvironment(Environment):
                 return False, "no_incoming_job"
             self._incoming_job = None
             self._metrics["rejected"] += 1.0
+            self._promote_next_incoming_job()
             return True, "rejected"
 
         if action_type == "route":
@@ -582,6 +596,44 @@ class CloudQueueEnvironment(Environment):
         # Apply strict open-interval clamp: validator rejects 0.0 and 1.0.
         return strict01(score), details
 
+    def _compute_action_mask(self, cfg: TaskConfig) -> list[int]:
+        """Compute which of the 8 actions are valid right now.
+
+        Slot order (matches CloudQueueAction.action_type):
+          0: configure_task  — always valid (meta, sets next task/seed)
+          1: admit           — only if an incoming job is waiting
+          2: reject          — only if an incoming job is waiting
+          3: route           — only if an incoming job is waiting
+          4: dispatch        — only if an idle+active server AND a non-empty queue exist
+          5: scale           — only if cfg.allow_scaling is True
+          6: reprioritize    — only if cfg.allow_priority AND a normal-priority job is queued
+          7: noop            — always valid
+        """
+        has_incoming = self._incoming_job is not None
+
+        has_idle_server = any(
+            s["active"] and s["job"] is None for s in self._servers
+        )
+        has_queued_job = any(len(q) > 0 for q in self._queues)
+        can_dispatch = 1 if (has_idle_server and has_queued_job) else 0
+
+        can_reprioritize = 0
+        if cfg.allow_priority:
+            can_reprioritize = 1 if any(
+                job["priority"] == 1 for q in self._queues for job in q
+            ) else 0
+
+        return [
+            1,                              # 0: configure_task
+            1 if has_incoming else 0,       # 1: admit
+            1 if has_incoming else 0,       # 2: reject
+            1 if has_incoming else 0,       # 3: route
+            can_dispatch,                   # 4: dispatch
+            1 if cfg.allow_scaling else 0,  # 5: scale
+            can_reprioritize,               # 6: reprioritize
+            1,                              # 7: noop
+        ]
+
     def _build_observation(self, reward: float, done: bool, info: dict) -> CloudQueueObservation:
         cfg = self._task_configs[self._active_task_id]
         queue_lengths = [len(q) for q in self._queues]
@@ -625,6 +677,7 @@ class CloudQueueEnvironment(Environment):
                 "invalid_actions": self._metrics["invalid_actions"],
                 "harmful_scale_down": self._metrics["harmful_scale_down"],
                 "infra_cost": round(self._metrics["infra_cost"], 4),
+                "pending_incoming_jobs": float(len(self._incoming_buffer) + (1 if self._incoming_job else 0)),
             },
             "episode_score": round(score, 4),
             "score_details": score_details,
@@ -650,7 +703,7 @@ class CloudQueueEnvironment(Environment):
             energy_cost_rate=round(energy_cost_rate, 4),
             level=cfg.level,
             optional_history=[round(v, 4) for v in list(self._recent_rewards)],
-            action_mask=[1 for _ in range(8)],
+            action_mask=self._compute_action_mask(cfg),
             done=done,
             reward=round(reward, 6),
             metadata=metadata,
@@ -697,7 +750,10 @@ class CloudQueueEnvironment(Environment):
             f"d={action.scale_delta}|p={action.new_priority}"
         )
         self._action_trace.append(action_key)
-        self._autodispatch()
+        autodispatch_applied = False
+        if self.ASSISTED_AUTODISPATCH:
+            self._autodispatch()
+            autodispatch_applied = True
         reward, reward_components = self._compute_reward(
             cfg,
             action_ok=action_ok,
@@ -714,6 +770,7 @@ class CloudQueueEnvironment(Environment):
             "note": action_note,
             "completed_this_step": completed_this_step,
             "abandoned_this_step": abandoned_this_step,
+            "autodispatch_applied": autodispatch_applied,
             "reward_components": reward_components,
             "debug_trace_id": self._trace_digest(),
         }
