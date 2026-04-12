@@ -42,12 +42,27 @@ REPORT_CSV_PATH = os.getenv("REPORT_CSV_PATH")
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
-    You are controlling a queue operations environment.
-    Return exactly one JSON object with keys:
-    action_type, target_queue, target_server, scale_delta, new_priority.
-    Allowed action_type values: admit, reject, route, dispatch, scale, reprioritize, noop.
-    Keep values simple integers or null when not used.
-    Return only JSON and no extra text.
+    You are an agent controlling a cloud queue scheduling environment.
+    Your goal: minimize wait times, SLA violations, and cost while maximizing throughput.
+
+    ACTIONS (return exactly one JSON object, no extra text):
+      {"action_type": "admit",       "target_queue": 0}          — accept incoming job into queue 0
+      {"action_type": "route",       "target_queue": 1}          — accept incoming job into queue 1 (medium/hard only)
+      {"action_type": "reject",      "target_queue": null}       — reject incoming job (use when queues are filling up)
+      {"action_type": "dispatch",    "target_queue": 0}          — move job from queue to an idle server
+      {"action_type": "reprioritize","new_priority": 2}         — promote a normal job to urgent (medium/hard only)
+      {"action_type": "scale",       "scale_delta": 1}           — add 1 server (+1) or remove 1 server (-1) (hard only)
+      {"action_type": "noop",        "target_queue": null}       — do nothing
+
+    STRATEGY HINTS:
+      - REJECT jobs when queue fill is above 60% to prevent overflow and SLA breaches.
+      - ADMIT when queues have space and server is idle.
+      - DISPATCH after admitting to keep servers busy.
+      - On medium/hard: ROUTE urgent jobs (priority=2) to a less-loaded queue.
+      - On hard: SCALE up (+1) when queue_fill > 70% and cost allows; scale down when queues are empty.
+      - Negative reward means the system is struggling — change strategy.
+
+    Return ONLY valid JSON. No explanation.
     """
 ).strip()
 
@@ -176,17 +191,45 @@ def write_reports(seed_rows: list[dict], task_score_table: dict[str, list[float]
             print(f"[DEBUG] Failed to write REPORT_CSV_PATH: {exc}", flush=True)
 
 
+def build_obs_summary(obs: "CloudQueueObservation", task_name: str) -> str:
+    """Build a rich, structured text summary of the observation for the LLM prompt."""
+    # Queue fill percentages — helps model know when to reject
+    max_sizes = {"easy": 28, "medium": 42, "hard": 64}
+    max_q = max_sizes.get(task_name, 30)
+    fills = [f"{l}/{max_q}({100*l//max_q}%)" for l in obs.queue_lengths]
+
+    # Server status
+    busy_count = sum(obs.server_busy)
+    total_servers = len(obs.server_busy)
+    servers_str = f"{busy_count}/{total_servers} busy"
+
+    # Incoming job info
+    if obs.incoming_job_present:
+        urgency = "URGENT" if obs.incoming_job_priority >= 2 else "normal"
+        incoming_str = f"YES [{urgency} size={obs.incoming_job_size:.1f} deadline={obs.incoming_job_deadline:.0f}]"
+    else:
+        incoming_str = "none"
+
+    return (
+        f"task={task_name} | "
+        f"queues={fills} | "
+        f"servers={servers_str} | "
+        f"incoming={incoming_str} | "
+        f"sla_breach={obs.sla_violation_rate:.3f} | "
+        f"abandonment={obs.abandonment_rate:.3f} | "
+        f"cost_rate={obs.energy_cost_rate:.3f}"
+    )
+
+
 def build_user_prompt(step: int, obs_summary: str, last_reward: float, history: List[str], task_name: str) -> str:
     history_block = "\n".join(history[-4:]) if history else "None"
     return textwrap.dedent(
         f"""
-        Task: {task_name}
-        Step: {step}
-        Observation summary: {obs_summary}
-        Last reward: {last_reward:.2f}
-        Previous steps:
+        Step {step} | Last reward: {last_reward:.2f}
+        State: {obs_summary}
+        Recent actions:
         {history_block}
-        Decide the next action.
+        Choose the best action now.
         """
     ).strip()
 
@@ -282,6 +325,29 @@ def normalize_base_url(base_url: Optional[str]) -> Optional[str]:
     return cleaned
 
 
+def _smoke_test_model(client: OpenAI) -> bool:
+    """Make one cheap test call to verify the model API is reachable.
+
+    Prints [MODEL_OK] on success or [MODEL_FAIL] on error.
+    Returns True if the model is working, False otherwise.
+    """
+    print(f"[MODEL_CHECK] Testing model={MODEL_NAME} at {API_BASE_URL} ...", flush=True)
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "Reply with the single word: ready"}],
+            temperature=0.0,
+            max_tokens=20,
+        )
+        reply = (resp.choices[0].message.content or "").strip()
+        print(f"[MODEL_OK] model is reachable. reply={reply!r}", flush=True)
+        return True
+    except Exception as exc:
+        print(f"[MODEL_FAIL] Cannot reach model: {exc}", flush=True)
+        print("[MODEL_FAIL] Will fall back to heuristic for all steps.", flush=True)
+        return False
+
+
 async def main() -> None:
     if not API_KEY and not USE_HEURISTIC_ONLY:
         raise ValueError("API_KEY is required for model inference.")
@@ -301,7 +367,10 @@ async def main() -> None:
         env = await CloudQueueEnv.from_docker_image(IMAGE_NAME)
 
     try:
+        # Run smoke test before benchmark — confirms model API is reachable.
         model_enabled = client is not None
+        if client is not None:
+            model_enabled = _smoke_test_model(client)
         task_seed_map = parse_task_seed_map()
         replay_map = load_replay_actions()
         task_score_table: dict[str, list[float]] = {}
@@ -338,11 +407,7 @@ async def main() -> None:
                         break
 
                     obs = result.observation
-                    obs_summary = (
-                        f"queues={obs.queue_lengths}, incoming={obs.incoming_job_present}, "
-                        f"priority={obs.incoming_job_priority}, sla_rate={obs.sla_violation_rate:.3f}, "
-                        f"abandonment={obs.abandonment_rate:.3f}, cost={obs.energy_cost_rate:.3f}"
-                    )
+                    obs_summary = build_obs_summary(obs, task_name)
 
                     action = None
                     model_error = None
@@ -397,6 +462,16 @@ async def main() -> None:
 
                 if isinstance(result.observation.metadata, dict):
                     score = float(result.observation.metadata.get("episode_score", 0.0) or 0.0)
+                    # Debug: print raw server metadata so we can verify grader output
+                    _m = result.observation.metadata
+                    print(
+                        f"[DEBUG_META] task={task_name} seed={seed} "
+                        f"episode_score={_m.get('episode_score')} "
+                        f"score_details={_m.get('score_details')} "
+                        f"metrics_completed={_m.get('metrics', {}).get('completed')} "
+                        f"metrics_arrivals={_m.get('metrics', {}).get('arrivals')}",
+                        flush=True,
+                    )
                 score = max(0.0, min(1.0, score))
                 task_score_table[task_name].append(score)
                 success = score >= SUCCESS_SCORE_THRESHOLD
