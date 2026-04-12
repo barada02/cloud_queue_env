@@ -127,8 +127,8 @@ def parse_task_seed_map() -> dict[str, list[int]]:
                     task_map[str(task_name)] = parsed
             if task_map:
                 return task_map
-        except Exception as exc:
-            print(f"[DEBUG] Invalid TASK_SEEDS_JSON, falling back to defaults: {exc}", flush=True)
+        except Exception:
+            pass
 
     return {
         "easy": [SEEDS[0]],
@@ -154,8 +154,7 @@ def load_replay_actions() -> dict[str, list[CloudQueueAction]]:
     try:
         with open(ACTION_TRACE_FILE, "r", encoding="utf-8") as f:
             payload = json.load(f)
-    except Exception as exc:
-        print(f"[DEBUG] Failed to load ACTION_TRACE_FILE: {exc}", flush=True)
+    except Exception:
         return {}
 
     replay: dict[str, list[CloudQueueAction]] = {}
@@ -196,8 +195,8 @@ def write_reports(seed_rows: list[dict], task_score_table: dict[str, list[float]
         try:
             with open(REPORT_JSON_PATH, "w", encoding="utf-8") as f:
                 json.dump(report_payload, f, indent=2)
-        except Exception as exc:
-            print(f"[DEBUG] Failed to write REPORT_JSON_PATH: {exc}", flush=True)
+        except Exception:
+            pass
 
     if REPORT_CSV_PATH:
         try:
@@ -219,8 +218,8 @@ def write_reports(seed_rows: list[dict], task_score_table: dict[str, list[float]
                 writer.writeheader()
                 for row in seed_rows:
                     writer.writerow(row)
-        except Exception as exc:
-            print(f"[DEBUG] Failed to write REPORT_CSV_PATH: {exc}", flush=True)
+        except Exception:
+            pass
 
 
 def build_obs_summary(obs: CloudQueueObservation, task_name: str) -> str:
@@ -418,10 +417,6 @@ def get_model_action(
         )
 
         text = (completion.choices[0].message.content or "").strip()
-        print(
-            f"[MODEL_OUTPUT] task={task_name} step={step} raw={_single_line(text)}",
-            flush=True,
-        )
         action = parse_model_action(text, task_name)
         if action is None:
             preview = " ".join(text.split())[:180]
@@ -453,7 +448,6 @@ def get_model_action_with_retry(
         if action is not None:
             return action, None
         last_error = error
-        print(f"[DEBUG] Model action parse failed on attempt={attempt}: {error}", flush=True)
     return None, last_error
 
 
@@ -488,7 +482,6 @@ def normalize_base_url(base_url: Optional[str]) -> Optional[str]:
 
 
 def _smoke_test_model(client: OpenAI) -> bool:
-    print(f"[MODEL_CHECK] Testing model={MODEL_NAME} at {API_BASE_URL} ...", flush=True)
     test_question = (
         "You are a cloud scheduling agent. "
         "A job queue is 80% full and a new urgent job just arrived. "
@@ -504,12 +497,9 @@ def _smoke_test_model(client: OpenAI) -> bool:
         )
         reply = (resp.choices[0].message.content or "").strip()
         if not reply:
-            print("[MODEL_FAIL] Model returned an empty response.", flush=True)
             return False
-        print("[MODEL_OK] model endpoint reachable.", flush=True)
         return True
-    except Exception as exc:
-        print(f"[MODEL_FAIL] Cannot reach model: {exc}", flush=True)
+    except Exception:
         return False
 
 
@@ -624,25 +614,11 @@ async def main() -> None:
 
                 if failure_reason is None and isinstance(result.observation.metadata, dict):
                     score = float(result.observation.metadata.get("episode_score", OPEN_SCORE_MIN) or OPEN_SCORE_MIN)
-                    _m = result.observation.metadata
-                    print(
-                        f"[DEBUG_META] task={task_name} seed={seed} "
-                        f"episode_score={_m.get('episode_score')} "
-                        f"score_details={_m.get('score_details')} "
-                        f"metrics_completed={_m.get('metrics', {}).get('completed')} "
-                        f"metrics_arrivals={_m.get('metrics', {}).get('arrivals')}",
-                        flush=True,
-                    )
                 elif failure_reason is not None:
                     score = OPEN_SCORE_MIN
 
                 if failure_reason is None and not bool(result.done):
                     failure_reason = "episode_not_done_within_max_steps"
-                    print(
-                        "[DEBUG] Episode ended early before done=true; "
-                        "set MAX_STEPS_OVERRIDE=0 or unset it for valid benchmark scores.",
-                        flush=True,
-                    )
                     score = OPEN_SCORE_MIN
 
                 score = clamp_open_score(score)
@@ -664,21 +640,11 @@ async def main() -> None:
                     "failure_reason": failure_reason or "",
                 }
                 seed_rows.append(seed_row)
-                print(
-                    "[REPORT_SEED] "
-                    f"task={seed_row['task']} seed={seed_row['seed']} score={seed_row['score']:.3f} "
-                    f"steps={seed_row['steps']} trace={seed_row['trace_digest']}",
-                    flush=True,
-                )
 
             task_scores = task_score_table[task_name]
             task_mean = statistics.mean(task_scores) if task_scores else OPEN_SCORE_MIN
             task_std = statistics.pstdev(task_scores) if len(task_scores) > 1 else 0.0
             task_ci = ci95(task_scores)
-            print(
-                f"[REPORT] task={task_name} seeds={len(task_scores)} mean={task_mean:.3f} std={task_std:.3f} ci95={task_ci:.3f}",
-                flush=True,
-            )
 
         all_task_means = []
         for task_name in TASKS:
@@ -691,18 +657,13 @@ async def main() -> None:
             easy_mean = clamp_open_score(statistics.mean(task_score_table.get("easy", [OPEN_SCORE_MIN])))
             medium_mean = clamp_open_score(statistics.mean(task_score_table.get("medium", [OPEN_SCORE_MIN])))
             hard_mean = clamp_open_score(statistics.mean(task_score_table.get("hard", [OPEN_SCORE_MIN])))
-            print(
-                f"[SUMMARY] easy={easy_mean:.3f} medium={medium_mean:.3f} hard={hard_mean:.3f} final={final_score:.3f}",
-                flush=True,
-            )
-
             write_reports(seed_rows=seed_rows, task_score_table=task_score_table)
 
     finally:
         try:
             await env.close()
-        except Exception as exc:
-            print(f"[DEBUG] env.close() error (container cleanup): {exc}", flush=True)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
