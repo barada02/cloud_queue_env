@@ -326,21 +326,35 @@ def normalize_base_url(base_url: Optional[str]) -> Optional[str]:
 
 
 def _smoke_test_model(client: OpenAI) -> bool:
-    """Make one cheap test call to verify the model API is reachable.
+    """Verify the model API is reachable AND can generate a coherent response.
 
-    Prints [MODEL_OK] on success or [MODEL_FAIL] on error.
+    Asks a short queue-domain question that requires a real sentence answer.
+    An empty or missing reply is treated as failure — not just exceptions.
+
+    Prints [MODEL_OK] or [MODEL_FAIL] with details.
     Returns True if the model is working, False otherwise.
     """
     print(f"[MODEL_CHECK] Testing model={MODEL_NAME} at {API_BASE_URL} ...", flush=True)
+    test_question = (
+        "You are a cloud scheduling agent. "
+        "A job queue is 80% full and a new urgent job just arrived. "
+        "Should you admit the job, reject it, or route it to another queue? "
+        "Answer in one sentence and explain why."
+    )
     try:
         resp = client.chat.completions.create(
             model=MODEL_NAME,
-            messages=[{"role": "user", "content": "Reply with the single word: ready"}],
+            messages=[{"role": "user", "content": test_question}],
             temperature=0.0,
-            max_tokens=20,
+            max_tokens=80,
         )
         reply = (resp.choices[0].message.content or "").strip()
-        print(f"[MODEL_OK] model is reachable. reply={reply!r}", flush=True)
+        if not reply:
+            print("[MODEL_FAIL] Model returned an empty response.", flush=True)
+            print("[MODEL_FAIL] Will fall back to heuristic for all steps.", flush=True)
+            return False
+        print(f"[MODEL_OK] model is reasoning correctly.", flush=True)
+        print(f"[MODEL_OK] test reply: {reply}", flush=True)
         return True
     except Exception as exc:
         print(f"[MODEL_FAIL] Cannot reach model: {exc}", flush=True)
